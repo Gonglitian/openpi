@@ -36,24 +36,22 @@ def resize_image(image: np.ndarray, size: tuple) -> np.ndarray:
     return np.array(image.resize(size, resample=Image.BICUBIC))
 
 
-def downsample_to_15hz(data: dict, fps_source: float = 30.0, fps_target: float = 15.0) -> dict:
-    """Downsample trajectory data from source fps to target fps.
+def downsample_trajectory(data: dict, fps_source: float, fps_target: float) -> dict:
+    """Downsample trajectory data if needed. Returns data as-is when source fps <= target fps.
 
     Args:
         data: Dictionary with all trajectory data arrays
-        fps_source: Source frame rate (default 30Hz)
-        fps_target: Target frame rate (default 15Hz)
+        fps_source: Source frame rate
+        fps_target: Target frame rate
 
     Returns:
-        Downsampled data dictionary
+        Downsampled data dictionary (or original data if no downsampling needed)
     """
-    # Calculate downsampling factor
     downsample_factor = int(fps_source / fps_target)
 
     if downsample_factor <= 1:
         return data  # No downsampling needed
 
-    # Downsample all arrays by selecting every Nth frame
     downsampled = {}
     for key, value in data.items():
         if isinstance(value, np.ndarray):
@@ -134,18 +132,16 @@ def convert_trajectory_to_lerobot(
 
     # Determine output path
     if local_dir:
-        output_path = Path(local_dir) / repo_id
+        # --local_dir is used directly as dataset root, without appending repo_id
+        output_path = Path(local_dir)
         print(f"Using custom dataset directory: {output_path}")
-        # Clean up existing dataset in custom location
         if output_path.exists():
             print(f"Removing existing dataset at {output_path}")
             shutil.rmtree(output_path)
-        # Ensure parent directory exists, but let LeRobotDataset create the final directory
         output_path.parent.mkdir(parents=True, exist_ok=True)
     else:
         output_path = HF_LEROBOT_HOME / repo_id
         print(f"Using default dataset directory: {output_path}")
-        # Clean up existing dataset
         if output_path.exists():
             print(f"Removing existing dataset at {output_path}")
             shutil.rmtree(output_path)
@@ -231,15 +227,17 @@ def convert_trajectory_to_lerobot(
                 obs = episode_data["observations"]
                 metadata = episode_data["metadata"]
 
-                # Downsample from 30Hz to 15Hz
-                obs_downsampled = downsample_to_15hz(obs, fps_source=30.0, fps_target=15.0)
+                # Isaac Lab records at 15Hz (decimation=8, sim.dt=1/120), no downsampling needed.
+                # Automatically adapts if source data has a different fps via HDF5 metadata.
+                source_fps = float(metadata.get("fps", 15.0))
+                obs_downsampled = downsample_trajectory(obs, fps_source=source_fps, fps_target=15.0)
 
                 # Get episode length after downsampling
                 episode_length = len(obs_downsampled["timestamp"])
 
                 # Convert each timestep
                 for t in range(episode_length):
-                    # Resize images from (720, 1280) to (180, 320)
+                    # Resize images from (360, 640) to (180, 320)
                     exterior_image = resize_image(
                         obs_downsampled["external_cam"][t],
                         size=(320, 180)  # PIL uses (width, height)
@@ -309,8 +307,7 @@ def main():
         "--local_dir",
         type=str,
         default=None,
-        help="Custom directory for storing dataset (saves home dir space). "
-             "Dataset will be stored in <local_dir>/<repo_id>",
+        help="Custom directory for storing dataset (direct output path, no repo_id appended).",
     )
 
     args = parser.parse_args()

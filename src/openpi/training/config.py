@@ -90,6 +90,9 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Local root directory for LeRobot dataset. Falls back to HF_LEROBOT_HOME/repo_id if unset.
+    local_dir: str | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -171,6 +174,8 @@ class DataConfigFactory(abc.ABC):
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
     base_config: tyro.conf.Suppress[DataConfig | None] = None
+    # Local root directory for LeRobot dataset. Falls back to HF_LEROBOT_HOME/repo_id if unset.
+    local_dir: str | None = None
 
     @abc.abstractmethod
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -183,6 +188,7 @@ class DataConfigFactory(abc.ABC):
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
+            local_dir=self.local_dir,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
@@ -731,7 +737,8 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora"
         ),
         data=SimpleDataConfig(
-            repo_id="mingxuanyan/test_simeval_droid",  # Change this to your dataset
+            repo_id="regraspgen/PlayingCardsKitchen",
+            local_dir="/data4/vla-reasoning/regraspgen/PlayingCardsKitchen/lerobot_dataset",
             assets=AssetsConfig(),
             data_transforms=lambda model: _transforms.Group(
                 inputs=[
@@ -766,6 +773,8 @@ _CONFIGS = [
         ema_decay=None,  # Turn off EMA for LoRA fine-tuning
         batch_size=8,  # Reduced batch size for memory efficiency
         num_train_steps=5000,  # Adjust based on your dataset size
+        assets_base_dir="/data4/vla-reasoning/regraspgen/PlayingCardsKitchen/assets",
+        checkpoint_base_dir="/data4/vla-reasoning/regraspgen/PlayingCardsKitchen/checkpoints",
     ),
     TrainConfig(
         name="pi05_droid",
