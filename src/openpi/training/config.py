@@ -738,7 +738,7 @@ _CONFIGS = [
         ),
         data=SimpleDataConfig(
             repo_id="regraspgen/PlayingCardsKitchen",
-            local_dir="/data4/vla-reasoning/regraspgen/PlayingCardsKitchen/lerobot_dataset",
+            local_dir="/data1/vla-reasoning/regraspgen/PlayingCardsKitchen/lerobot_dataset",
             assets=AssetsConfig(),
             data_transforms=lambda model: _transforms.Group(
                 inputs=[
@@ -773,8 +773,8 @@ _CONFIGS = [
         ema_decay=None,  # Turn off EMA for LoRA fine-tuning
         batch_size=8,  # Reduced batch size for memory efficiency
         num_train_steps=5000,  # Adjust based on your dataset size
-        assets_base_dir="/data4/vla-reasoning/regraspgen/PlayingCardsKitchen/assets",
-        checkpoint_base_dir="/data4/vla-reasoning/regraspgen/PlayingCardsKitchen/checkpoints",
+        assets_base_dir="/data1/vla-reasoning/regraspgen/PlayingCardsKitchen/assets",
+        checkpoint_base_dir="/data1/vla-reasoning/regraspgen/PlayingCardsKitchen/checkpoints",
     ),
     TrainConfig(
         name="pi05_droid",
