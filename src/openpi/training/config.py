@@ -454,6 +454,52 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class RegraspGenSimEvalDataConfig(DataConfigFactory):
+    """Data config for RegraspGen simulation evaluation datasets in LeRobot format.
+
+    Uses DROID-style transforms with delta action conversion for absolute joint position actions.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/joint_position": "joint_position",
+                        "observation/gripper_position": "gripper_position",
+                        "observation/exterior_image_1_left": "exterior_image_1_left",
+                        "observation/wrist_image_left": "wrist_image_left",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        # Our dataset has absolute joint position actions, so we apply delta conversion.
+        # The mask converts the first 7 dims (joints) to delta, leaving the 8th (gripper) absolute.
+        delta_action_mask = _transforms.make_bool_mask(7, -1)
+        data_transforms = _transforms.Group(
+            inputs=[
+                droid_policy.DroidInputs(model_type=model_config.model_type),
+                _transforms.DeltaActions(delta_action_mask),
+            ],
+            outputs=[
+                _transforms.AbsoluteActions(delta_action_mask),
+                droid_policy.DroidOutputs(),
+            ],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -954,6 +1000,78 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
+    ),
+    #
+    # RegraspGen SimEval configs.
+    #
+    TrainConfig(
+        name="pi05_droid_simeval_lora",
+        model=pi0.Pi0Config(
+            action_horizon=15,
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=RegraspGenSimEvalDataConfig(
+            repo_id="regraspgen/PlayingCardsKitchen",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/polaris/pi05_droid_jointpos_polaris/params"
+        ),
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=8,
+        num_train_steps=5000,
+    ),
+    TrainConfig(
+        name="pi05_base_simeval_lora",
+        model=pi0.Pi0Config(
+            action_horizon=15,
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=RegraspGenSimEvalDataConfig(
+            repo_id="regraspgen/PlayingCardsKitchen",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=8,
+        num_train_steps=5000,
+    ),
+    TrainConfig(
+        name="pi05_droid_only_simeval_lora",
+        model=pi0.Pi0Config(
+            action_horizon=15,
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=RegraspGenSimEvalDataConfig(
+            repo_id="regraspgen/PlayingCardsKitchen",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_droid/params"
+        ),
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=8,
+        num_train_steps=5000,
     ),
     #
     # RoboArena configs.
