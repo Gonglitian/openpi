@@ -64,8 +64,6 @@ override-dependencies = [
     "ml-dtypes==0.4.1",
     "tensorstore==0.1.74",
     "rerun-sdk ; sys_platform == 'never'",
-    "pyav ; sys_platform == 'never'",
-    "av ; sys_platform == 'never'",
     "pymunk ; sys_platform == 'never'",
 ]
 environments = ["sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version == '3.11.*'"]
