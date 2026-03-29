@@ -30,6 +30,7 @@ class Policy(BasePolicy):
         output_transforms: Sequence[_transforms.DataTransformFn] = (),
         sample_kwargs: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        proprio_memory_len: int = 0,
     ):
         self._sample_actions = nnx_utils.module_jit(model.sample_actions)
         self._input_transform = _transforms.compose(transforms)
@@ -37,12 +38,29 @@ class Policy(BasePolicy):
         self._rng = rng or jax.random.key(0)
         self._sample_kwargs = sample_kwargs or {}
         self._metadata = metadata or {}
+        self._proprio_memory_len = proprio_memory_len
+        self._state_history_buffer: list[np.ndarray] = []
 
     @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
+
+        # Build state history from buffer for proprio memory.
+        if self._proprio_memory_len > 0:
+            current_state = inputs["state"]
+            self._state_history_buffer.append(np.array(current_state))
+            if len(self._state_history_buffer) > self._proprio_memory_len + 1:
+                self._state_history_buffer = self._state_history_buffer[-(self._proprio_memory_len + 1) :]
+            # Build history: pad with zeros if not enough past states yet.
+            past_states = self._state_history_buffer[:-1]  # exclude current
+            if len(past_states) < self._proprio_memory_len:
+                pad_count = self._proprio_memory_len - len(past_states)
+                pad_state = np.zeros_like(current_state)
+                past_states = [pad_state] * pad_count + past_states
+            inputs["state_history"] = np.stack(past_states, axis=0)  # [K, state_dim]
+
         # Make a batch and convert to jax.Array.
         inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
 

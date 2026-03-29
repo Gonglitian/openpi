@@ -89,6 +89,11 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Number of past proprioceptive states for proprio memory (0 = disabled).
+    proprio_memory_len: int = 0
+    # Raw observation keys to load history for (before repack). Used with delta_timestamps.
+    state_history_observation_keys: Sequence[str] = ()
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -462,20 +467,33 @@ class RegraspGenSimEvalDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/joint_position": "joint_position",
-                        "observation/gripper_position": "gripper_position",
-                        "observation/exterior_image_1_left": "exterior_image_1_left",
-                        "observation/wrist_image_left": "wrist_image_left",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
+        # Determine proprio memory config from model.
+        proprio_memory_len = 0
+        if isinstance(model_config, pi0.Pi0Config):
+            proprio_memory_len = model_config.proprio_memory_len
+
+        repack_inputs = [
+            _transforms.RepackTransform(
+                {
+                    "observation/joint_position": "joint_position",
+                    "observation/gripper_position": "gripper_position",
+                    "observation/exterior_image_1_left": "exterior_image_1_left",
+                    "observation/wrist_image_left": "wrist_image_left",
+                    "actions": "actions",
+                    "prompt": "prompt",
+                }
+            )
+        ]
+        # If proprio memory is enabled, extract state history from temporal keys (after repack).
+        if proprio_memory_len > 0:
+            repack_inputs.append(
+                _transforms.ExtractStateHistory(
+                    temporal_keys=("observation/joint_position", "observation/gripper_position"),
+                    proprio_memory_len=proprio_memory_len,
                 )
-            ]
-        )
+            )
+        repack_transform = _transforms.Group(inputs=repack_inputs)
+
         # Our dataset has absolute joint position actions, so we apply delta conversion.
         # The mask converts the first 7 dims (joints) to delta, leaving the 8th (gripper) absolute.
         delta_action_mask = _transforms.make_bool_mask(7, -1)
@@ -491,11 +509,18 @@ class RegraspGenSimEvalDataConfig(DataConfigFactory):
         )
         model_transforms = ModelTransformFactory()(model_config)
 
+        # State history observation keys for delta_timestamps (raw dataset keys, before repack).
+        state_history_obs_keys = ()
+        if proprio_memory_len > 0:
+            state_history_obs_keys = ("joint_position", "gripper_position")
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            proprio_memory_len=proprio_memory_len,
+            state_history_observation_keys=state_history_obs_keys,
         )
 
 
@@ -1064,6 +1089,33 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_droid/params"
+        ),
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=8,
+        num_train_steps=5000,
+    ),
+    #
+    # RegraspGen SimEval with Proprio Memory.
+    #
+    TrainConfig(
+        name="pi05_droid_simeval_proprio_memory_lora",
+        model=pi0.Pi0Config(
+            action_horizon=15,
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            proprio_memory_len=5,
+        ),
+        data=RegraspGenSimEvalDataConfig(
+            repo_id="regraspgen/PlayingCardsKitchen",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/polaris/pi05_droid_jointpos_polaris/params"
         ),
         freeze_filter=pi0.Pi0Config(
             paligemma_variant="gemma_2b_lora",

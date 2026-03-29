@@ -127,12 +127,17 @@ class Normalize(DataTransformFn):
         if self.norm_stats is None:
             return data
 
-        return apply_tree(
+        data = apply_tree(
             data,
             self.norm_stats,
             self._normalize_quantile if self.use_quantiles else self._normalize,
             strict=self.strict,
         )
+        # Normalize state_history using the same stats as state.
+        if "state_history" in data and self.norm_stats is not None and "state" in self.norm_stats:
+            norm_fn = self._normalize_quantile if self.use_quantiles else self._normalize
+            data["state_history"] = norm_fn(data["state_history"], self.norm_stats["state"])
+        return data
 
     def _normalize(self, x, stats: NormStats):
         mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]
@@ -334,6 +339,44 @@ class PadStatesAndActions(DataTransformFn):
         data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
+        if "state_history" in data:
+            data["state_history"] = pad_to_dim(data["state_history"], self.model_action_dim, axis=-1)
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtractStateHistory(DataTransformFn):
+    """Extracts state history from temporal state keys loaded via delta_timestamps.
+
+    When delta_timestamps loads K+1 timesteps for state observation keys, each key
+    has shape [K+1, dim]. This transform splits them into:
+    - current state (last timestep, shape [dim]) — replaces the original key
+    - state history (first K timesteps, shape [K, dim]) — stored separately
+
+    The history from all state keys is concatenated along the last axis to form
+    the combined state_history field.
+    """
+
+    # Keys that have temporal dimension (after repack), e.g. ("joint_position", "gripper_position")
+    temporal_keys: tuple[str, ...]
+    # Number of past steps (K). The temporal dim should be K+1.
+    proprio_memory_len: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        history_parts = []
+        for key in self.temporal_keys:
+            if key not in data:
+                continue
+            val = data[key]
+            if val.ndim < 2 or val.shape[0] != self.proprio_memory_len + 1:
+                # No temporal dimension or unexpected shape — skip.
+                continue
+            # Last timestep is current, first K are history.
+            data[key] = val[-1]  # shape: [dim]
+            history_parts.append(val[:-1])  # shape: [K, dim]
+        if history_parts:
+            # Concatenate along the state dimension: [K, dim1] + [K, dim2] -> [K, dim1+dim2]
+            data["state_history"] = np.concatenate(history_parts, axis=-1)
         return data
 
 

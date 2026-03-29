@@ -80,6 +80,9 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    # Number of past proprioceptive states to use as memory (0 = disabled).
+    # Each past state is projected via a linear layer into the backbone embedding space.
+    proprio_memory_len: int = 0
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -103,6 +106,11 @@ class Pi0Config(_model.BaseModelConfig):
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
+        state_history_spec = None
+        if self.proprio_memory_len > 0:
+            state_history_spec = jax.ShapeDtypeStruct(
+                [batch_size, self.proprio_memory_len, self.action_dim], jnp.float32
+            )
         with at.disable_typechecking():
             observation_spec = _model.Observation(
                 images={
@@ -116,6 +124,7 @@ class Pi0Config(_model.BaseModelConfig):
                     "right_wrist_0_rgb": image_mask_spec,
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                state_history=state_history_spec,
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )
@@ -182,6 +191,10 @@ class Pi0(_model.BaseModel):
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+        self.proprio_memory_len = config.proprio_memory_len
+        if config.proprio_memory_len > 0:
+            # Project each past proprioceptive state into the backbone embedding space (prefix).
+            self.state_history_proj = nnx.Linear(config.action_dim, paligemma_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -223,6 +236,16 @@ class Pi0(_model.BaseModel):
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+
+        # add proprio memory: project each past state separately into backbone embedding space
+        if self.proprio_memory_len > 0 and obs.state_history is not None:
+            # obs.state_history: (b, K, state_dim) -> project to (b, K, emb)
+            history_tokens = self.state_history_proj(obs.state_history)
+            tokens.append(history_tokens)
+            input_mask.append(jnp.ones(history_tokens.shape[:2], dtype=jnp.bool_))
+            # proprio memory tokens attend bidirectionally with images and language
+            ar_mask += [False] * history_tokens.shape[1]
+
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)

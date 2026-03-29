@@ -48,6 +48,11 @@ def create_trained_policy(
             raise ValueError("Asset id is required to load norm stats.")
         norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
 
+    # Determine proprio memory length from model config.
+    proprio_memory_len = 0
+    if hasattr(train_config.model, "proprio_memory_len"):
+        proprio_memory_len = train_config.model.proprio_memory_len
+
     return _policy.Policy(
         model,
         transforms=[
@@ -65,4 +70,5 @@ def create_trained_policy(
         ],
         sample_kwargs=sample_kwargs,
         metadata=train_config.policy_metadata,
+        proprio_memory_len=proprio_memory_len,
     )

@@ -71,6 +71,9 @@ class DroidInputs(transforms.DataTransformFn):
                 data["prompt"] = data["prompt"].decode("utf-8")
             inputs["prompt"] = data["prompt"]
 
+        if "state_history" in data:
+            inputs["state_history"] = np.asarray(data["state_history"])
+
         return inputs
 
 
