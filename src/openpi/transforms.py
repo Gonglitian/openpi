@@ -351,16 +351,18 @@ class ExtractStateHistory(DataTransformFn):
     When delta_timestamps loads K+1 timesteps for state observation keys, each key
     has shape [K+1, dim]. This transform splits them into:
     - current state (last timestep, shape [dim]) — replaces the original key
-    - state history (first K timesteps, shape [K, dim]) — stored separately
+    - state history (first K timesteps) — uniformly subsampled to num_samples frames
 
     The history from all state keys is concatenated along the last axis to form
-    the combined state_history field.
+    the combined state_history field of shape [num_samples, total_state_dim].
     """
 
     # Keys that have temporal dimension (after repack), e.g. ("joint_position", "gripper_position")
     temporal_keys: tuple[str, ...]
     # Number of past steps (K). The temporal dim should be K+1.
     proprio_memory_len: int
+    # Number of frames to uniformly sample from the K history steps.
+    num_samples: int = 10
 
     def __call__(self, data: DataDict) -> DataDict:
         history_parts = []
@@ -376,7 +378,17 @@ class ExtractStateHistory(DataTransformFn):
             history_parts.append(val[:-1])  # shape: [K, dim]
         if history_parts:
             # Concatenate along the state dimension: [K, dim1] + [K, dim2] -> [K, dim1+dim2]
-            data["state_history"] = np.concatenate(history_parts, axis=-1)
+            full_history = np.concatenate(history_parts, axis=-1)  # [K, total_dim]
+            # Uniformly subsample K frames to num_samples frames.
+            K = full_history.shape[0]
+            if K >= self.num_samples:
+                indices = np.linspace(0, K - 1, self.num_samples, dtype=int)
+                data["state_history"] = full_history[indices]  # [num_samples, total_dim]
+            else:
+                # Fewer history frames than requested — pad with zeros at the start.
+                pad_len = self.num_samples - K
+                pad = np.zeros((pad_len, full_history.shape[-1]), dtype=full_history.dtype)
+                data["state_history"] = np.concatenate([pad, full_history], axis=0)
         return data
 
 

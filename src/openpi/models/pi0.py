@@ -80,9 +80,12 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
-    # Number of past proprioceptive states to use as memory (0 = disabled).
-    # Each past state is projected via a linear layer into the backbone embedding space.
+    # Number of past proprioceptive states to load via delta_timestamps (0 = disabled).
+    # From these, `proprio_memory_num_samples` frames are uniformly sampled and
+    # embedded into a single prefix token via an MLP.
     proprio_memory_len: int = 0
+    # Number of frames to uniformly sample from the history window.
+    proprio_memory_num_samples: int = 10
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -109,7 +112,7 @@ class Pi0Config(_model.BaseModelConfig):
         state_history_spec = None
         if self.proprio_memory_len > 0:
             state_history_spec = jax.ShapeDtypeStruct(
-                [batch_size, self.proprio_memory_len, self.action_dim], jnp.float32
+                [batch_size, self.proprio_memory_num_samples, self.action_dim], jnp.float32
             )
         with at.disable_typechecking():
             observation_spec = _model.Observation(
@@ -192,9 +195,12 @@ class Pi0(_model.BaseModel):
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         self.proprio_memory_len = config.proprio_memory_len
+        self.proprio_memory_num_samples = config.proprio_memory_num_samples
         if config.proprio_memory_len > 0:
-            # Project each past proprioceptive state into the backbone embedding space (prefix).
-            self.state_history_proj = nnx.Linear(config.action_dim, paligemma_config.width, rngs=rngs)
+            # MLP: concatenated sampled states [num_samples * action_dim] → single token [emb]
+            state_input_dim = config.proprio_memory_num_samples * config.action_dim
+            self.state_history_mlp_in = nnx.Linear(state_input_dim, paligemma_config.width, rngs=rngs)
+            self.state_history_mlp_out = nnx.Linear(paligemma_config.width, paligemma_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -237,14 +243,19 @@ class Pi0(_model.BaseModel):
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
 
-        # add proprio memory: project each past state separately into backbone embedding space
+        # add proprio memory: embed uniformly sampled past states into a single prefix token
         if self.proprio_memory_len > 0 and obs.state_history is not None:
-            # obs.state_history: (b, K, state_dim) -> project to (b, K, emb)
-            history_tokens = self.state_history_proj(obs.state_history)
-            tokens.append(history_tokens)
-            input_mask.append(jnp.ones(history_tokens.shape[:2], dtype=jnp.bool_))
-            # proprio memory tokens attend bidirectionally with images and language
-            ar_mask += [False] * history_tokens.shape[1]
+            # obs.state_history: (b, num_samples, state_dim)
+            b = obs.state_history.shape[0]
+            # flatten sampled states: (b, num_samples * state_dim)
+            flat_history = obs.state_history.reshape(b, -1)
+            # MLP: concat → hidden → GELU → output → single token (b, 1, emb)
+            h = jax.nn.gelu(self.state_history_mlp_in(flat_history))
+            memory_token = self.state_history_mlp_out(h)[:, None, :]  # (b, 1, emb)
+            tokens.append(memory_token)
+            input_mask.append(jnp.ones((b, 1), dtype=jnp.bool_))
+            # single memory token attends bidirectionally with images and language
+            ar_mask += [False]
 
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)

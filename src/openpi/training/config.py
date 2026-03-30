@@ -485,11 +485,15 @@ class RegraspGenSimEvalDataConfig(DataConfigFactory):
             )
         ]
         # If proprio memory is enabled, extract state history from temporal keys (after repack).
+        num_samples = 10
+        if isinstance(model_config, pi0.Pi0Config):
+            num_samples = model_config.proprio_memory_num_samples
         if proprio_memory_len > 0:
             repack_inputs.append(
                 _transforms.ExtractStateHistory(
                     temporal_keys=("observation/joint_position", "observation/gripper_position"),
                     proprio_memory_len=proprio_memory_len,
+                    num_samples=num_samples,
                 )
             )
         repack_transform = _transforms.Group(inputs=repack_inputs)
@@ -1108,7 +1112,8 @@ _CONFIGS = [
             pi05=True,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
-            proprio_memory_len=5,
+            proprio_memory_len=30,  # 2 seconds at 15Hz
+            proprio_memory_num_samples=10,  # uniformly sample 10 frames, embed into 1 token
         ),
         data=RegraspGenSimEvalDataConfig(
             repo_id="regraspgen/PlayingCardsKitchen",
