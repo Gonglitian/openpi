@@ -19,7 +19,39 @@ from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
 
-from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
+# LeRobot 默认数据目录
+HF_LEROBOT_HOME = Path.home() / ".cache" / "huggingface" / "lerobot"
+
+# PlayingCardsKitchen 固定 goal pose (LOCAL 坐标, wxyz 四元数)
+FIXED_GOAL_POSE = np.array([0.5, 0.0, 0.03, 0.02, 0.00, -0.7047, 0.7095], dtype=np.float32)
+
+
+def assemble_42d_state(obs: dict, t: int) -> np.ndarray:
+    """将单帧 obs 组装为 42D 特权 state 向量。
+
+    布局: [joint_pos(7), joint_vel(7), gripper(1), ee_pose(7),
+           object_pose(7), goal_pose(7), tcp_to_obj(3), obj_to_goal(3)]
+    """
+    joint_pos = obs["joint_position"][t].astype(np.float32)           # (7,)
+    joint_vel = obs["joint_velocity"][t].astype(np.float32)           # (7,)
+    gripper = np.atleast_1d(obs["gripper_position"][t]).astype(np.float32)[:1]  # (1,)
+    ee_pose = obs["ee_pose"][t].astype(np.float32)                    # (7,)
+
+    if "object_pose" in obs:
+        obj_pose = obs["object_pose"][t].astype(np.float32)           # (7,)
+    else:
+        obj_pose = np.zeros(7, dtype=np.float32)
+
+    goal_pose = FIXED_GOAL_POSE                                       # (7,)
+    tcp_to_obj = ee_pose[:3] - obj_pose[:3]                           # (3,)
+    obj_to_goal = obj_pose[:3] - goal_pose[:3]                        # (3,)
+
+    return np.concatenate([
+        joint_pos, joint_vel, gripper, ee_pose,
+        obj_pose, goal_pose, tcp_to_obj, obj_to_goal,
+    ])  # (42,)
 
 
 def resize_image(image: np.ndarray, size: tuple) -> np.ndarray:
@@ -79,6 +111,8 @@ def load_episode_from_hdf5(hdf5_file: h5py.File, episode_key: str) -> dict | Non
     # 检查必要字段是否存在（不完整 episode 可能只有图像）
     required_obs = ["joint_position", "joint_velocity", "gripper_position",
                     "gripper_velocity", "ee_pose", "ee_velocity", "timestamp"]
+    # object_pose 是可选的（旧数据可能没有）
+    optional_obs = ["object_pose"]
     obs_group = ep_group.get("observations")
     if obs_group is None:
         return None
@@ -103,6 +137,11 @@ def load_episode_from_hdf5(hdf5_file: h5py.File, episode_key: str) -> dict | Non
         "ee_velocity": ep_group["observations/ee_velocity"][:],
         "timestamp": ep_group["observations/timestamp"][:],
     }
+
+    # 可选字段
+    for opt_key in optional_obs:
+        if opt_key in obs_group:
+            obs[opt_key] = obs_group[opt_key][:]
 
     # Load actions
     actions = {
@@ -130,14 +169,17 @@ def convert_trajectory_to_lerobot(
     repo_id: str,
     push_to_hub: bool = False,
     local_dir: str = None,
+    state_42d: bool = False,
+    success_only: bool = False,
 ):
-    """Convert SimEval trajectory to LeRobot dataset.
+    """Convert SimEval trajectory to LeRoBot dataset.
 
     Args:
         input_dir: Directory containing trajectory HDF5 files
-        repo_id: LeRobot dataset repository ID
+        repo_id: LeRoBot dataset repository ID
         push_to_hub: Whether to push to Hugging Face Hub
         local_dir: Optional custom directory for storing dataset (saves home dir space)
+        state_42d: 输出预组装 42D state (无图像)，用于 DP/ACT state-only 训练
     """
     input_path = Path(input_dir)
 
@@ -166,13 +208,24 @@ def convert_trajectory_to_lerobot(
             print(f"Removing existing dataset at {output_path}")
             shutil.rmtree(output_path)
 
-    # Create LeRobot dataset with DROID features
-    print(f"Creating LeRobot dataset: {repo_id}")
-    create_kwargs = {
-        "repo_id": repo_id,
-        "robot_type": "panda",
-        "fps": 15,  # Target FPS after downsampling
-        "features": {
+    # Create LeRoBot dataset
+    print(f"Creating LeRoBot dataset: {repo_id} (state_42d={state_42d})")
+
+    if state_42d:
+        features = {
+            "state": {
+                "dtype": "float32",
+                "shape": (42,),
+                "names": ["state"],
+            },
+            "actions": {
+                "dtype": "float32",
+                "shape": (8,),
+                "names": ["actions"],
+            },
+        }
+    else:
+        features = {
             "exterior_image_1_left": {
                 "dtype": "image",
                 "shape": (180, 320, 3),
@@ -213,12 +266,23 @@ def convert_trajectory_to_lerobot(
                 "shape": (6,),
                 "names": ["ee_velocity"],
             },
+            "object_pose": {
+                "dtype": "float32",
+                "shape": (7,),
+                "names": ["object_pose"],
+            },
             "actions": {
                 "dtype": "float32",
                 "shape": (8,),
                 "names": ["actions"],
             },
-        },
+        }
+
+    create_kwargs = {
+        "repo_id": repo_id,
+        "robot_type": "panda",
+        "fps": 15,  # Target FPS after downsampling
+        "features": features,
         "image_writer_threads": 10,
         "image_writer_processes": 5,
     }
@@ -257,6 +321,13 @@ def convert_trajectory_to_lerobot(
                 obs = episode_data["observations"]
                 metadata = episode_data["metadata"]
 
+                # success-only 过滤: metadata 中的 success 是字符串 "True" / "False"
+                if success_only:
+                    succ_val = metadata.get("success", "")
+                    if str(succ_val).lower() != "true":
+                        skipped_episodes += 1
+                        continue
+
                 # 根据 HDF5 metadata 中的 fps 决定是否降采样
                 source_fps = metadata.get("fps", 15.0)
                 if source_fps > 15.0:
@@ -269,35 +340,48 @@ def convert_trajectory_to_lerobot(
 
                 # Convert each timestep
                 for t in range(episode_length):
-                    # 图像: 如果 HDF5 中已经是 180×320 则直接使用，否则 resize
-                    raw_ext = obs_downsampled["external_cam"][t]
-                    raw_wrist = obs_downsampled["wrist_cam"][t]
-                    target_size = (320, 180)  # PIL uses (width, height)
-                    if raw_ext.shape[:2] == (180, 320):
-                        exterior_image = raw_ext
+                    if state_42d:
+                        # 42D state-only 模式: 预组装 42D state，无图像
+                        frame = {
+                            "state": assemble_42d_state(obs_downsampled, t),
+                            "actions": obs_downsampled["actions"][t].astype(np.float32),
+                        }
                     else:
-                        exterior_image = resize_image(raw_ext, size=target_size)
-                    if raw_wrist.shape[:2] == (180, 320):
-                        wrist_image = raw_wrist
-                    else:
-                        wrist_image = resize_image(raw_wrist, size=target_size)
+                        # 完整模式: 个别 obs key + 图像
+                        raw_ext = obs_downsampled["external_cam"][t]
+                        raw_wrist = obs_downsampled["wrist_cam"][t]
+                        target_size = (320, 180)  # PIL uses (width, height)
+                        if raw_ext.shape[:2] == (180, 320):
+                            exterior_image = raw_ext
+                        else:
+                            exterior_image = resize_image(raw_ext, size=target_size)
+                        if raw_wrist.shape[:2] == (180, 320):
+                            wrist_image = raw_wrist
+                        else:
+                            wrist_image = resize_image(raw_wrist, size=target_size)
 
-                    # Add frame to LeRobot dataset
-                    dataset.add_frame({
-                        "exterior_image_1_left": exterior_image,
-                        "wrist_image_left": wrist_image,
-                        "joint_position": obs_downsampled["joint_position"][t].astype(np.float32),
-                        "joint_velocity": obs_downsampled["joint_velocity"][t].astype(np.float32),
-                        "gripper_position": np.array([obs_downsampled["gripper_position"][t]], dtype=np.float32),
-                        "gripper_velocity": np.array([obs_downsampled["gripper_velocity"][t]], dtype=np.float32),
-                        "ee_pose": obs_downsampled["ee_pose"][t].astype(np.float32),
-                        "ee_velocity": obs_downsampled["ee_velocity"][t].astype(np.float32),
-                        "actions": obs_downsampled["actions"][t].astype(np.float32),
-                        "task": metadata["instruction"],
-                    })
+                        frame = {
+                            "exterior_image_1_left": exterior_image,
+                            "wrist_image_left": wrist_image,
+                            "joint_position": obs_downsampled["joint_position"][t].astype(np.float32),
+                            "joint_velocity": obs_downsampled["joint_velocity"][t].astype(np.float32),
+                            "gripper_position": np.array([obs_downsampled["gripper_position"][t]], dtype=np.float32),
+                            "gripper_velocity": np.array([obs_downsampled["gripper_velocity"][t]], dtype=np.float32),
+                            "ee_pose": obs_downsampled["ee_pose"][t].astype(np.float32),
+                            "ee_velocity": obs_downsampled["ee_velocity"][t].astype(np.float32),
+                            "actions": obs_downsampled["actions"][t].astype(np.float32),
+                        }
+                        # object_pose (可选)
+                        if "object_pose" in obs_downsampled:
+                            frame["object_pose"] = obs_downsampled["object_pose"][t].astype(np.float32)
+                        else:
+                            frame["object_pose"] = np.zeros(7, dtype=np.float32)
+                    # task 不作为 frame 字段（新版 LeRobot 在 save_episode 中传入）
+                    dataset.add_frame(frame)
 
-                # Save episode
-                dataset.save_episode()
+                # Save episode (task/instruction 在此传入)
+                task_str = str(metadata.get("instruction", "Flip the playing card"))
+                dataset.save_episode(task=task_str)
                 total_episodes += 1
 
     print(f"\n{'='*60}")
@@ -345,6 +429,16 @@ def main():
         help="Custom directory for storing dataset (saves home dir space). "
              "Dataset will be stored in <local_dir>/<repo_id>",
     )
+    parser.add_argument(
+        "--state_42d",
+        action="store_true",
+        help="输出预组装 42D state (无图像)，用于 DP/ACT state-only 训练",
+    )
+    parser.add_argument(
+        "--success_only",
+        action="store_true",
+        help="仅转换 metadata.success == True 的 episode",
+    )
 
     args = parser.parse_args()
 
@@ -358,6 +452,8 @@ def main():
         repo_id=args.repo_id,
         push_to_hub=args.push_to_hub,
         local_dir=args.local_dir,
+        state_42d=args.state_42d,
+        success_only=args.success_only,
     )
 
     print("\nConversion complete!")

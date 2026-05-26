@@ -15,8 +15,14 @@ class PaligemmaTokenizer:
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
-    def tokenize(self, prompt: str) -> tuple[np.ndarray, np.ndarray]:
+    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
+        # 当传入 state 时(Pi0.5 discrete_state_input 模式),把 state 离散化嵌入 prompt 前缀,
+        # 与 FASTTokenizer.tokenize 中的状态编码逻辑保持一致。
+        if state is not None:
+            discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+            state_str = " ".join(map(str, discretized_state))
+            cleaned_text = f"Task: {cleaned_text}, State: {state_str};"
         # tokenize "\n" separately as the "start of answer" token
         tokens = self._tokenizer.encode(cleaned_text, add_bos=True) + self._tokenizer.encode("\n")
         tokens_len = len(tokens)

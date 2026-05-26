@@ -137,14 +137,38 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    # HF_LEROBOT_HOME 环境变量指向本地数据集根目录，LeRoBot 会自动拼接 repo_id
-    # 当 info.json 存在时 load_metadata() 成功，不会尝试联网验证
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    # HF_LEROBOT_HOME 指向数据集根目录 (包含 repo_id 子目录)
+    # local_files_only=True 阻止联网验证
+    # root 需要指向数据集的完整路径 (含 meta/info.json 的目录)
+    import os
+    from pathlib import Path as _Path
+    lerobot_home = os.environ.get("HF_LEROBOT_HOME")
+    if lerobot_home:
+        dataset_root = str(_Path(lerobot_home) / repo_id)
+    else:
+        dataset_root = None
+    root_kwarg = {"root": dataset_root} if dataset_root else {}
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(
+        repo_id, local_files_only=True, **root_kwarg,
+    )
+    # 构建 delta_timestamps: action keys (未来) + obs keys (历史)
+    delta_ts = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)]
+        for key in data_config.action_sequence_keys
+    }
+    # 观测历史帧: obs_horizon 从 model_config 获取 (默认 1 = 无历史)
+    obs_horizon = getattr(model_config, 'obs_horizon', 1)
+    if obs_horizon > 1 and data_config.obs_sequence_keys:
+        for key in data_config.obs_sequence_keys:
+            # 负时间戳 = 历史帧, 0 = 当前帧
+            # 例如 obs_horizon=3: [-2/fps, -1/fps, 0]
+            delta_ts[key] = [t / dataset_meta.fps for t in range(-(obs_horizon - 1), 1)]
+
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
+        local_files_only=True,
+        **root_kwarg,
+        delta_timestamps=delta_ts,
     )
 
     if data_config.prompt_from_task:

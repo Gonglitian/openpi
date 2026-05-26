@@ -6,7 +6,7 @@ import dataclasses
 import difflib
 import logging
 import pathlib
-from typing import Any, Literal, Protocol, TypeAlias
+from typing import Any, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -14,7 +14,7 @@ from typing_extensions import override
 import tyro
 
 import openpi.models.model as _model
-import openpi.models.pi0_config as pi0_config
+import openpi.models.pi0 as pi0
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
@@ -23,7 +23,6 @@ import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
-import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
@@ -90,12 +89,17 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Number of past proprioceptive states for proprio memory (0 = disabled).
+    proprio_memory_len: int = 0
+    # Raw observation keys to load history for (before repack). Used with delta_timestamps.
+    state_history_observation_keys: Sequence[str] = ()
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
-    # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
-    datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+    # Path to the data filter file for DROID dataset
+    filter_dict_path: str | None = None
 
 
 class GroupFactory(Protocol):
@@ -124,7 +128,7 @@ class ModelTransformFactory(GroupFactory):
                     ],
                 )
             case _model.ModelType.PI05:
-                assert isinstance(model_config, pi0_config.Pi0Config)
+                assert isinstance(model_config, pi0.Pi0Config)
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -215,14 +219,11 @@ class SimpleDataConfig(DataConfigFactory):
     data_transforms: tyro.conf.Suppress[GroupFactory] = dataclasses.field(default_factory=GroupFactory)
     # Factory for the model transforms.
     model_transforms: tyro.conf.Suppress[GroupFactory] = dataclasses.field(default_factory=ModelTransformFactory)
-    # 仅在训练数据加载时应用的 repack transforms（推理时不运行）
-    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(default_factory=_transforms.Group)
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
-            repack_transforms=self.repack_transforms,
             data_transforms=self.data_transforms(model_config),
             model_transforms=self.model_transforms(model_config),
         )
@@ -370,16 +371,8 @@ class RLDSDroidDataConfig(DataConfigFactory):
     # Filtering options. Can pass a path to a dictionary that maps episodes to timestep ranges
     # to tuples denoting ranges of time steps to keep (start, end). Episodes are uniquely identified with
     # f"{recording_folderpath}--{file_path}", both of which are present in the RLDS episode metadata.
-
-    # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
-    datasets: Sequence[droid_rlds_dataset.RLDSDataset] = (
-        droid_rlds_dataset.RLDSDataset(
-            name="droid",
-            version="1.0.1",
-            weight=1.0,
-            filter_dict_path="gs://openpi-assets/droid/droid_sample_ranges_v1_0_1.json",
-        ),
-    )
+    # Path to the filter dictionary file.
+    filter_dict_path: str | None = "gs://openpi-assets/droid/droid_sample_ranges_v1_0_1.json"
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -422,7 +415,7 @@ class RLDSDroidDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             rlds_data_dir=self.rlds_data_dir,
             action_space=self.action_space,
-            datasets=self.datasets,
+            filter_dict_path=self.filter_dict_path,
         )
 
 
@@ -466,6 +459,72 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class RegraspGenSimEvalDataConfig(DataConfigFactory):
+    """Data config for RegraspGen simulation evaluation datasets in LeRobot format.
+
+    Uses DROID-style transforms with delta action conversion for absolute joint position actions.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Determine proprio memory config from model.
+        proprio_memory_len = 0
+        if isinstance(model_config, pi0.Pi0Config):
+            proprio_memory_len = model_config.proprio_memory_len
+
+        repack_inputs = [
+            _transforms.RepackTransform(
+                {
+                    "observation/joint_position": "joint_position",
+                    "observation/gripper_position": "gripper_position",
+                    "observation/exterior_image_1_left": "exterior_image_1_left",
+                    "observation/wrist_image_left": "wrist_image_left",
+                    "actions": "actions",
+                    "prompt": "prompt",
+                }
+            )
+        ]
+        # If proprio memory is enabled, extract state history from temporal keys (after repack).
+        if proprio_memory_len > 0:
+            repack_inputs.append(
+                _transforms.ExtractStateHistory(
+                    temporal_keys=("observation/joint_position", "observation/gripper_position"),
+                    proprio_memory_len=proprio_memory_len,
+                )
+            )
+        repack_transform = _transforms.Group(inputs=repack_inputs)
+
+        # Our dataset has absolute joint position actions, so we apply delta conversion.
+        # The mask converts the first 7 dims (joints) to delta, leaving the 8th (gripper) absolute.
+        delta_action_mask = _transforms.make_bool_mask(7, -1)
+        data_transforms = _transforms.Group(
+            inputs=[
+                droid_policy.DroidInputs(model_type=model_config.model_type),
+                _transforms.DeltaActions(delta_action_mask),
+            ],
+            outputs=[
+                _transforms.AbsoluteActions(delta_action_mask),
+                droid_policy.DroidOutputs(),
+            ],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        # State history observation keys for delta_timestamps (raw dataset keys, before repack).
+        state_history_obs_keys = ()
+        if proprio_memory_len > 0:
+            state_history_obs_keys = ("joint_position", "gripper_position")
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            proprio_memory_len=proprio_memory_len,
+            state_history_observation_keys=state_history_obs_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -477,16 +536,10 @@ class TrainConfig:
     # Defines the model config. Some attributes (action_dim, action_horizon, and max_token_len) are shared by all models
     # -- see BaseModelConfig. Specific model implementations (e.g., Pi0Config) inherit from BaseModelConfig and may
     # define additional attributes.
-    model: _model.BaseModelConfig = dataclasses.field(default_factory=pi0_config.Pi0Config)
+    model: _model.BaseModelConfig = dataclasses.field(default_factory=pi0.Pi0Config)
 
     # A weight loader can optionally load (possibly partial) weights from disk after the model is initialized.
     weight_loader: weight_loaders.WeightLoader = dataclasses.field(default_factory=weight_loaders.NoOpWeightLoader)
-
-    # Optional path to a PyTorch checkpoint to load weights from.
-    pytorch_weight_path: str | None = None
-
-    # Precision for PyTorch training.
-    pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
@@ -566,7 +619,7 @@ _CONFIGS = [
     #
     TrainConfig(
         name="pi0_aloha",
-        model=pi0_config.Pi0Config(),
+        model=pi0.Pi0Config(),
         data=LeRobotAlohaDataConfig(
             assets=AssetsConfig(asset_id="trossen"),
         ),
@@ -574,7 +627,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_aloha",
-        model=pi0_config.Pi0Config(pi05=True),
+        model=pi0.Pi0Config(pi05=True),
         data=LeRobotAlohaDataConfig(
             assets=AssetsConfig(asset_id="trossen"),
         ),
@@ -582,7 +635,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi0_aloha_towel",
-        model=pi0_config.Pi0Config(),
+        model=pi0.Pi0Config(),
         data=LeRobotAlohaDataConfig(
             assets=AssetsConfig(asset_id="trossen"),
             default_prompt="fold the towel",
@@ -591,7 +644,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi0_aloha_tupperware",
-        model=pi0_config.Pi0Config(),
+        model=pi0.Pi0Config(),
         data=LeRobotAlohaDataConfig(
             assets=AssetsConfig(asset_id="trossen"),
             default_prompt="open the tupperware and put the food on the plate",
@@ -603,30 +656,12 @@ _CONFIGS = [
     #
     TrainConfig(
         name="pi0_droid",
-        model=pi0_config.Pi0Config(action_horizon=10),
+        model=pi0.Pi0Config(action_horizon=10),
         data=SimpleDataConfig(
             assets=AssetsConfig(asset_id="droid"),
             data_transforms=lambda model: _transforms.Group(
                 inputs=[droid_policy.DroidInputs(model_type=ModelType.PI0)],
                 outputs=[droid_policy.DroidOutputs()],
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-    ),
-    TrainConfig(
-        name="pi0_droid_joinpos",
-        model=pi0_config.Pi0Config(action_horizon=10),
-        data=SimpleDataConfig(
-            assets=AssetsConfig(asset_id="droid"),
-            data_transforms=lambda model: _transforms.Group(
-                inputs=[droid_policy.DroidInputs(model_type=ModelType.PI0)],
-                outputs=[
-                    # Convert model outputs from joint-delta to absolute joint targets (gripper remains absolute).
-                    _transforms.AbsoluteActions(_transforms.make_bool_mask(7, -1)),
-                    droid_policy.DroidOutputs(),
-                ],
             ),
             base_config=DataConfig(
                 prompt_from_task=True,
@@ -648,163 +683,13 @@ _CONFIGS = [
         ),
     ),
     TrainConfig(
-        name="pi0_fast_droid_joinpos",
-        model=pi0_fast.Pi0FASTConfig(action_dim=8, action_horizon=10),
-        data=SimpleDataConfig(
-            assets=AssetsConfig(asset_id="droid"),
-            data_transforms=lambda model: _transforms.Group(
-                inputs=[droid_policy.DroidInputs(model_type=ModelType.PI0_FAST)],
-                outputs=[
-                    # Convert model outputs from joint-delta to absolute joint targets (gripper remains absolute).
-                    _transforms.AbsoluteActions(_transforms.make_bool_mask(7, -1)),
-                    droid_policy.DroidOutputs(),
-                ],
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-    ),
-    TrainConfig(
-        name="pi0_fast_droid_joinpos_simeval_test",
-        model=pi0_fast.Pi0FASTConfig(action_dim=8, action_horizon=10),
-        data=SimpleDataConfig(
-            repo_id="mingxuanyan/test_simeval_droid",
-            assets=AssetsConfig(),  # No asset_id so it uses repo_id path
-            data_transforms=lambda model: _transforms.Group(
-                inputs=[
-                    # Repack LeRobot flat keys to observation/ prefixed format
-                    _transforms.RepackTransform({
-                        "observation/joint_position": "joint_position",
-                        "observation/gripper_position": "gripper_position",
-                        "observation/exterior_image_1_left": "exterior_image_1_left",
-                        "observation/wrist_image_left": "wrist_image_left",
-                        "actions": "actions",
-                        "prompt": "task",  # Map task to prompt
-                    }),
-                    droid_policy.DroidInputs(model_type=ModelType.PI0_FAST),
-                ],
-                outputs=[
-                    # Convert model outputs from joint-delta to absolute joint targets (gripper remains absolute).
-                    _transforms.AbsoluteActions(_transforms.make_bool_mask(7, -1)),
-                    droid_policy.DroidOutputs(),
-                ],
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-    ),
-    TrainConfig(
-        name="pi05_droid_joinpos_simeval_test",
-        model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
-        data=SimpleDataConfig(
-            repo_id="mingxuanyan/test_simeval_droid",
-            assets=AssetsConfig(),  # No asset_id so it uses repo_id path
-            data_transforms=lambda model: _transforms.Group(
-                inputs=[
-                    # Repack LeRobot flat keys to observation/ prefixed format
-                    _transforms.RepackTransform({
-                        "observation/joint_position": "joint_position",
-                        "observation/gripper_position": "gripper_position",
-                        "observation/exterior_image_1_left": "exterior_image_1_left",
-                        "observation/wrist_image_left": "wrist_image_left",
-                        "actions": "actions",
-                        "prompt": "task",  # Map task to prompt
-                    }),
-                    droid_policy.DroidInputs(model_type=ModelType.PI05),
-                ],
-                outputs=[
-                    # Convert model outputs from joint-delta to absolute joint targets (gripper remains absolute).
-                    _transforms.AbsoluteActions(_transforms.make_bool_mask(7, -1)),
-                    droid_policy.DroidOutputs(),
-                ],
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-    ),
-    TrainConfig(
-        name="pi05_droid_simeval_lora",
-        model=pi0_config.Pi0Config(
-            action_horizon=15,
-            pi05=True,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora"
-        ),
-        data=SimpleDataConfig(
-            repo_id="regraspgen/PlayingCardsKitchen",
-            assets=AssetsConfig(),
-            # repack_transforms 仅在训练数据加载时运行，推理时不运行
-            # 将 LeRobot flat keys 转换为 DROID policy 期望的 observation/ 前缀格式
-            repack_transforms=_transforms.Group(
-                inputs=[
-                    _transforms.RepackTransform({
-                        "observation/joint_position": "joint_position",
-                        "observation/gripper_position": "gripper_position",
-                        "observation/exterior_image_1_left": "exterior_image_1_left",
-                        "observation/wrist_image_left": "wrist_image_left",
-                        "actions": "actions",
-                        "prompt": "task",
-                    }),
-                ],
-            ),
-            data_transforms=lambda model: _transforms.Group(
-                inputs=[
-                    droid_policy.DroidInputs(model_type=ModelType.PI05),
-                    # 绝对关节位置 → delta（前 7 维转 delta，第 8 维夹爪保持绝对）
-                    # SimpleDataConfig 不会自动添加，必须手动添加
-                    _transforms.DeltaActions(_transforms.make_bool_mask(7, -1)),
-                ],
-                outputs=[
-                    # 推理时: delta → 绝对关节位置
-                    _transforms.AbsoluteActions(_transforms.make_bool_mask(7, -1)),
-                    droid_policy.DroidOutputs(),
-                ],
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-        # PolaRiS cotrained π₀.5-DROID checkpoint (jointpos / absolute actions)
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/polaris/pi05_droid_jointpos_polaris/params"
-        ),
-        freeze_filter=pi0_config.Pi0Config(
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora"
-        ).get_freeze_filter(),
-        ema_decay=None,  # Turn off EMA for LoRA fine-tuning
-        batch_size=8,  # Reduced batch size for memory efficiency
-        num_train_steps=5000,  # Adjust based on your dataset size
-    ),
-    TrainConfig(
         name="pi05_droid",
-        model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
+        model=pi0.Pi0Config(action_horizon=15, pi05=True),
         data=SimpleDataConfig(
             assets=AssetsConfig(asset_id="droid"),
             data_transforms=lambda model: _transforms.Group(
                 inputs=[droid_policy.DroidInputs(model_type=ModelType.PI05)],
                 outputs=[droid_policy.DroidOutputs()],
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-    ),
-    TrainConfig(
-        name="pi05_droid_joinpos",
-        model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
-        data=SimpleDataConfig(
-            assets=AssetsConfig(asset_id="droid"),
-            data_transforms=lambda model: _transforms.Group(
-                inputs=[droid_policy.DroidInputs(model_type=ModelType.PI05)],
-                outputs=[
-                    # Convert model outputs from joint-delta to absolute joint targets (gripper remains absolute).
-                    _transforms.AbsoluteActions(_transforms.make_bool_mask(7, -1)),
-                    droid_policy.DroidOutputs(),
-                ],
             ),
             base_config=DataConfig(
                 prompt_from_task=True,
@@ -825,7 +710,7 @@ _CONFIGS = [
         # Here you define the model config -- In this example we use pi0 as the model
         # architecture and perform *full* finetuning. in the examples below we show how to modify
         # this to perform *low-memory* (LORA) finetuning and use pi0-FAST as an alternative architecture.
-        model=pi0_config.Pi0Config(),
+        model=pi0.Pi0Config(),
         # Here you define the dataset you are training on. In this example we use the Libero
         # dataset. For your own dataset, you can change the repo_id to point to your dataset.
         # Also modify the DataConfig to use the new config you made for your dataset above.
@@ -849,7 +734,7 @@ _CONFIGS = [
     TrainConfig(
         name="pi0_libero_low_mem_finetune",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
-        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
@@ -861,7 +746,7 @@ _CONFIGS = [
         # We have a convenience function in the model config that returns the default freeze filter
         # for the given model config for LoRA finetuning. Just make sure it matches the model config
         # you chose above.
-        freeze_filter=pi0_config.Pi0Config(
+        freeze_filter=pi0.Pi0Config(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
@@ -913,7 +798,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_libero",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        model=pi0.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
@@ -928,18 +813,19 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets-preview/checkpoints/pi05_may21_280k_v1/params"
+        ),
         num_train_steps=30_000,
     ),
     #
     # Fine-tuning Aloha configs.
     #
     # This is a test config that is used to illustate how train on a custom LeRobot dataset.
-    # For instructions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
+    # For instuctions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
     TrainConfig(
         name="pi0_aloha_pen_uncap",
-        model=pi0_config.Pi0Config(),
+        model=pi0.Pi0Config(),
         data=LeRobotAlohaDataConfig(
             repo_id="physical-intelligence/aloha_pen_uncap_diverse",
             assets=AssetsConfig(
@@ -968,11 +854,11 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_aloha_pen_uncap",
-        model=pi0_config.Pi0Config(pi05=True),
+        model=pi0.Pi0Config(pi05=True),
         data=LeRobotAlohaDataConfig(
             repo_id="physical-intelligence/aloha_pen_uncap_diverse",
             assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                assets_dir="gs://openpi-assets-preview/checkpoints/pi05_may21_280k_v1/assets",
                 asset_id="trossen",
             ),
             default_prompt="uncap the pen",
@@ -992,7 +878,9 @@ _CONFIGS = [
                 ]
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets-preview/checkpoints/pi05_may21_280k_v1/params"
+        ),
         num_train_steps=20_000,
         batch_size=64,
     ),
@@ -1034,7 +922,7 @@ _CONFIGS = [
         # We use RLDS data loading to make training on this large dataset tractable.
         # For fine-tuning on your own DROID dataset, see below.
         name="pi05_full_droid_finetune",
-        model=pi0_config.Pi0Config(
+        model=pi0.Pi0Config(
             pi05=True,
             action_dim=32,
             action_horizon=16,
@@ -1045,11 +933,13 @@ _CONFIGS = [
             rlds_data_dir="/mnt/pi-data/kevin",
             action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
             assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets/",
+                assets_dir="gs://openpi-assets-preview/checkpoints/pi05_may21_280k_v1/assets/",
                 asset_id="droid",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets-preview/checkpoints/pi05_may21_280k_v1/params"
+        ),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=5e-5,
@@ -1068,7 +958,7 @@ _CONFIGS = [
         # Here, we use LeRobot data format (like for all other fine-tuning examples)
         # To convert your custom DROID dataset (<10s of hours) to LeRobot format, see examples/droid/convert_droid_data_to_lerobot.py
         name="pi05_droid_finetune",
-        model=pi0_config.Pi0Config(
+        model=pi0.Pi0Config(
             pi05=True,
             action_dim=32,  # pi05 is trained with 32-dim actions
             action_horizon=16,
@@ -1079,11 +969,11 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(
                 # Important: reuse the original DROID norm stats during fine-tuning!
-                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                assets_dir="gs://openpi-assets-preview/checkpoints/pi05_droid/assets",
                 asset_id="droid",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets-preview/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
     ),
@@ -1092,7 +982,7 @@ _CONFIGS = [
     #
     TrainConfig(
         name="pi0_aloha_sim",
-        model=pi0_config.Pi0Config(),
+        model=pi0.Pi0Config(),
         data=LeRobotAlohaDataConfig(
             repo_id="lerobot/aloha_sim_transfer_cube_human",
             default_prompt="Transfer cube",
@@ -1108,7 +998,7 @@ _CONFIGS = [
         name="debug",
         data=FakeDataConfig(),
         batch_size=2,
-        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
+        model=pi0.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
         save_interval=100,
         overwrite=True,
         exp_name="debug",
@@ -1119,7 +1009,7 @@ _CONFIGS = [
         name="debug_restore",
         data=FakeDataConfig(),
         batch_size=2,
-        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
+        model=pi0.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
         weight_loader=weight_loaders.CheckpointWeightLoader("./checkpoints/debug/debug/9/params"),
         overwrite=True,
         exp_name="debug",
@@ -1128,7 +1018,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="debug_pi05",
-        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"),
+        model=pi0.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"),
         data=FakeDataConfig(),
         batch_size=2,
         num_train_steps=10,
@@ -1136,9 +1026,117 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
-    # RoboArena & PolaRiS configs.
+    #
+    # RegraspGen SimEval configs.
+    #
+    TrainConfig(
+        name="pi05_droid_simeval_lora",
+        model=pi0.Pi0Config(
+            action_horizon=15,
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=RegraspGenSimEvalDataConfig(
+            repo_id="regraspgen/PlayingCardsKitchen",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        # 本地 ckpt(与 GCS gs://openpi-assets/checkpoints/polaris/pi05_droid_jointpos_polaris/params 同源,免下载 12 GB)
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data4/nerako/reasoning/openpi_checkpoints/pi05_droid_jointpos_polaris/pi05_droid_jointpos_polaris/params"
+        ),
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # decay_steps 与 num_train_steps 保持一致,让 cosine decay 在训练末尾完成
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=40_000,
+            decay_lr=2.5e-6,
+        ),
+        ema_decay=None,
+        batch_size=8,
+        num_train_steps=5000,
+    ),
+    TrainConfig(
+        name="pi05_base_simeval_lora",
+        model=pi0.Pi0Config(
+            action_horizon=15,
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=RegraspGenSimEvalDataConfig(
+            repo_id="regraspgen/PlayingCardsKitchen",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=8,
+        num_train_steps=5000,
+    ),
+    TrainConfig(
+        name="pi05_droid_only_simeval_lora",
+        model=pi0.Pi0Config(
+            action_horizon=15,
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=RegraspGenSimEvalDataConfig(
+            repo_id="regraspgen/PlayingCardsKitchen",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_droid/params"
+        ),
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=8,
+        num_train_steps=5000,
+    ),
+    #
+    # RegraspGen SimEval with Proprio Memory.
+    #
+    TrainConfig(
+        name="pi05_droid_simeval_proprio_memory_lora",
+        model=pi0.Pi0Config(
+            action_horizon=15,
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            proprio_memory_len=5,
+        ),
+        data=RegraspGenSimEvalDataConfig(
+            repo_id="regraspgen/PlayingCardsKitchen",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/polaris/pi05_droid_jointpos_polaris/params"
+        ),
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=8,
+        num_train_steps=5000,
+    ),
+    #
+    # RoboArena configs.
+    #
     *roboarena_config.get_roboarena_configs(),
-    *polaris_config.get_polaris_configs(),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

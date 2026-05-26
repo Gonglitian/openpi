@@ -127,20 +127,27 @@ class Normalize(DataTransformFn):
         if self.norm_stats is None:
             return data
 
-        return apply_tree(
+        data = apply_tree(
             data,
             self.norm_stats,
             self._normalize_quantile if self.use_quantiles else self._normalize,
             strict=self.strict,
         )
+        # Normalize state_history using the same stats as state.
+        if "state_history" in data and self.norm_stats is not None and "state" in self.norm_stats:
+            norm_fn = self._normalize_quantile if self.use_quantiles else self._normalize
+            data["state_history"] = norm_fn(data["state_history"], self.norm_stats["state"])
+        return data
 
     def _normalize(self, x, stats: NormStats):
-        return (x - stats.mean) / (stats.std + 1e-6)
+        mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]
+        return (x - mean) / (std + 1e-6)
 
     def _normalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
-        return (x - stats.q01) / (stats.q99 - stats.q01 + 1e-6) * 2.0 - 1.0
+        q01, q99 = stats.q01[..., : x.shape[-1]], stats.q99[..., : x.shape[-1]]
+        return (x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -166,12 +173,17 @@ class Unnormalize(DataTransformFn):
         )
 
     def _unnormalize(self, x, stats: NormStats):
-        return x * (stats.std + 1e-6) + stats.mean
+        mean = pad_to_dim(stats.mean, x.shape[-1], axis=-1, value=0.0)
+        std = pad_to_dim(stats.std, x.shape[-1], axis=-1, value=1.0)
+        return x * (std + 1e-6) + mean
 
     def _unnormalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
-        return (x + 1.0) / 2.0 * (stats.q99 - stats.q01 + 1e-6) + stats.q01
+        q01, q99 = stats.q01, stats.q99
+        if (dim := q01.shape[-1]) < x.shape[-1]:
+            return np.concatenate([(x[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, x[..., dim:]], axis=-1)
+        return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
 
 
 @dataclasses.dataclass(frozen=True)
@@ -240,15 +252,22 @@ class AbsoluteActions(DataTransformFn):
 @dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer
+    discrete_state_input: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
             raise ValueError("Prompt is required")
 
+        if self.discrete_state_input:
+            if (state := data.get("state", None)) is None:
+                raise ValueError("State is required.")
+        else:
+            state = None
+
         if not isinstance(prompt, str):
             prompt = prompt.item()
 
-        tokens, token_masks = self.tokenizer.tokenize(prompt)
+        tokens, token_masks = self.tokenizer.tokenize(prompt, state)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 
 
@@ -308,6 +327,57 @@ class PromptFromLeRobotTask(DataTransformFn):
             raise ValueError(f"{task_index=} not found in task mapping: {self.tasks}")
 
         return {**data, "prompt": prompt}
+
+
+@dataclasses.dataclass(frozen=True)
+class PadStatesAndActions(DataTransformFn):
+    """Zero-pads states and actions to the model action dimension."""
+
+    model_action_dim: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
+        if "actions" in data:
+            data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
+        if "state_history" in data:
+            data["state_history"] = pad_to_dim(data["state_history"], self.model_action_dim, axis=-1)
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtractStateHistory(DataTransformFn):
+    """Extracts state history from temporal state keys loaded via delta_timestamps.
+
+    When delta_timestamps loads K+1 timesteps for state observation keys, each key
+    has shape [K+1, dim]. This transform splits them into:
+    - current state (last timestep, shape [dim]) — replaces the original key
+    - state history (first K timesteps, shape [K, dim]) — stored separately
+
+    The history from all state keys is concatenated along the last axis to form
+    the combined state_history field.
+    """
+
+    # Keys that have temporal dimension (after repack), e.g. ("joint_position", "gripper_position")
+    temporal_keys: tuple[str, ...]
+    # Number of past steps (K). The temporal dim should be K+1.
+    proprio_memory_len: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        history_parts = []
+        for key in self.temporal_keys:
+            if key not in data:
+                continue
+            val = data[key]
+            if val.ndim < 2 or val.shape[0] != self.proprio_memory_len + 1:
+                # No temporal dimension or unexpected shape — skip.
+                continue
+            # Last timestep is current, first K are history.
+            data[key] = val[-1]  # shape: [dim]
+            history_parts.append(val[:-1])  # shape: [K, dim]
+        if history_parts:
+            # Concatenate along the state dimension: [K, dim1] + [K, dim2] -> [K, dim1+dim2]
+            data["state_history"] = np.concatenate(history_parts, axis=-1)
+        return data
 
 
 def flatten_dict(tree: at.PyTree) -> dict:
@@ -393,13 +463,13 @@ def apply_tree(
     return unflatten_dict({k: transform(k, v) for k, v in tree.items()})
 
 
-def pad_to_dim(x: np.ndarray, target_dim: int, axis: int = -1) -> np.ndarray:
+def pad_to_dim(x: np.ndarray, target_dim: int, axis: int = -1, value: float = 0.0) -> np.ndarray:
     """Pad an array to the target dimension with zeros along the specified axis."""
     current_dim = x.shape[axis]
     if current_dim < target_dim:
         pad_width = [(0, 0)] * len(x.shape)
         pad_width[axis] = (0, target_dim - current_dim)
-        return np.pad(x, pad_width)
+        return np.pad(x, pad_width, constant_values=value)
     return x
 
 
